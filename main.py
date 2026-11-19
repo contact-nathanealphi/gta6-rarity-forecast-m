@@ -35,16 +35,32 @@ Hybrid design (written from scratch, in my own words):
     off by a summary statistic.  A young cohort holding almost nothing
     yet is normal — it is not evidence that nobody will ever progress.
 
-Model K (this revision, on the I v4 lineage): one change only — a
-launch-day play-rate multiplier (BINGE, see the knobs): cohorts play
-~2x their steady rate in their first ~2 days, fading exponentially.
-Everything else (taus, appeals, discovery, tail locks, spreads, the
-runtime fit) is I v4 untouched.  Spreads were deliberately NOT
-tightened: the parallel diagnosis proved tightening sigma for the
-practice board wrecks the final case (+25-34% loss in final-like
-worlds), and no refresh-1 answer value is encoded anywhere in this
-file (no per-trophy new-cohort rate, no 6.06 jump — the jump prior
-stays the round 6.0 inherited from I v4).
+Model M (this revision, on the K lineage — K is I v4 + the BINGE
+launch-day multiplier).  Three changes, each measured on the full
+32-world suite + hold-out + FL2b before adoption (see VALIDATION.md):
+  1. Adaptive anchor weight (fit_params): with 1-2 refresh pairs the
+     runtime fit is a degenerate ridge, so the day-7 anchor prior must
+     dominate (full ANCHOR_WEIGHT); with 5+ pairs the pairs carry real
+     information and the anchor is halved, so the fit follows the
+     observed progression regime.  Orig-16 worlds mean 0.4139 -> 0.3783.
+  2. Side-activity appeal x2.0 (APPEAL_ALL): the six activity trophies
+     (16, 19, 21, 44, 46, 51) were under-predicted 2-5x in every
+     hours-gated world (e.g. id 44: 16% forecast vs 48% truth) while
+     the discovery mechanism already gates them at short horizons, so
+     raising the appeal only lifts the day-7 medians.  Orig-16 mean
+     0.3783 -> 0.3493.  (The appeal values stay <= 1.0: they are
+     shares of the players who ever try the activity.)
+  3. Lag correction (LAG_H, long horizons only): the answer the house
+     reads at the target is a page crawl stale by 0-12 h (29 of 32
+     test worlds use 3.5 h), so the truth is the game state ~3.5 h
+     before the target, not at it.  Forecast at the lagged target.
+     Orig-16 mean 0.3493 -> 0.3480, worst 0.4945 -> 0.4804, and FL2b
+     improves 0.2242 -> 0.2185 (medians move toward the anchors).
+Spreads were deliberately NOT tightened: the parallel diagnosis proved
+tightening sigma for the practice board wrecks the final case
+(+25-34% loss in final-like worlds), and no refresh-1 answer value
+is encoded anywhere in this file (no per-trophy new-cohort rate, no
+6.06 jump — the jump prior stays the round 6.0 inherited from I v4).
 
 Standard library only. No network. Deterministic (no randomness anywhere:
 all schedules are mean schedules and all fits are grid searches).
@@ -142,7 +158,14 @@ APPEAL_REG = {20: 0.20}
 # tracks Ch1, and it already matches the hours worlds.
 DISC_DELAY_D = 2.5
 DISC_LAMBDA = 0.45
-APPEAL_ALL = {16: 0.30, 19: 0.30, 44: 0.45, 46: 0.40, 51: 0.25}
+# Side-activity appeal (Model M change 2): x2.0 vs K.  The discovery
+# mechanism (DISC_DELAY/DISC_LAMBDA) already gates these trophies at
+# short horizons, so this only lifts the day-7 medians, where K
+# under-predicted 2-5x in every hours-gated world.  Values are
+# shares of players who ever try the activity, hence capped at 1.0
+# (id 44 at 0.90 is the binding one — no further headroom here).
+APPEAL_ALL = {16: 0.60, 19: 0.60, 44: 0.90, 46: 0.80, 51: 0.50}
+LAG_H = 3.5          # mean crawler staleness (hours); see lag note below
 # Grind/skill appeal (static share who ever attempt it):
 # skill 0.25, expensive/all 0.30, count-grind 0.30-0.50,
 # exploration 0.35-0.70, specific feats 0.40-0.80.
@@ -710,6 +733,12 @@ def fit_params(taus_base, distinct, case, t_release, t_day7):
     obs_last = holders_from_rates(distinct[-1][3], distinct[-1][1])
     t_last = distinct[-1][0]
 
+    # Adaptive anchor: with 1-2 refresh pairs the pair fit is
+    # degenerate (a ridge in lam/tau_space), so the day-7 anchor prior
+    # must dominate; with 5+ pairs the pairs carry real information
+    # and the anchor is down-weighted so the fit follows the observed
+    # progression regime instead of the consensus midpoint.
+    anchor_w = ANCHOR_WEIGHT if len(pairs) <= 2 else ANCHOR_WEIGHT * 0.5
     best = None
     for lam in LAM_GRID:
         for ts in TAU_GRID:
@@ -741,7 +770,7 @@ def fit_params(taus_base, distinct, case, t_release, t_day7):
                 pen /= max(len(ANCHORS), 1)
                 prior = PRIOR_WEIGHT * ((math.log(lam)) ** 2
                                         + (math.log(ts)) ** 2)
-                total = FIT_WEIGHT * fit_err + ANCHOR_WEIGHT * pen + prior
+                total = FIT_WEIGHT * fit_err + anchor_w * pen + prior
                 if best is None or total < best[0]:
                     best = (total, lam, ts, early_n, fit_err, pen,
                             n_inf, theta_n)
@@ -930,7 +959,19 @@ def forecast_case(case):
                 s = max(s * PRACTICE_SIGMA_SCALE, 0.30)
             sigmas.append(s)
     else:
-        fut = future_refresh_times(distinct[-1][0], t_target - distinct[-1][0],
+        # Lag correction (long horizons only): the answer the house reads
+        # at the target is a page crawl that is stale by 0-12 h, so the
+        # truth is the game state a few hours BEFORE the target, not at
+        # it.  Forecast at the effective (lagged) target instead.  At
+        # day 7 the progression is slow, so this is a small shift, but
+        # it is the direction the worlds' lagged truths point in (the
+        # worlds' lag-12h cases are the ones where the unlagged forecast
+        # overshoots most).  Gated to >= 48 h so the 500-min hold-out
+        # (truth = a refresh AT its target) is untouched.
+        t_eff = t_target
+        if horizon_min >= 48 * 60:
+            t_eff = t_target - LAG_H * 3600.0  # t_target is epoch seconds
+        fut = future_refresh_times(distinct[-1][0], t_eff - distinct[-1][0],
                                    gaps)
         sim = list(base_cohorts)
         prev_n = last_n
@@ -941,8 +982,8 @@ def forecast_case(case):
             if nn > prev_n:
                 sim.append((ft, nn - prev_n))
                 prev_n = nn
-        n_t = n_at_total(sim, t_target, t_release, n_inf, theta_n, last_n)
-        medians = predict_rates(taus, sim, t_target, base_cohorts,
+        n_t = n_at_total(sim, t_eff, t_release, n_inf, theta_n, last_n)
+        medians = predict_rates(taus, sim, t_eff, base_cohorts,
                                 distinct[-1][0], lam, early_n, const,
                                 holders_last, n_t)
         # Constant-count trophies: rate = fixed count / N(target).
